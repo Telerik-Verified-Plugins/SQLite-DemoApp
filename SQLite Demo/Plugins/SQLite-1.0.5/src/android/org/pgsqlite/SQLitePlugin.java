@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, Chris Brody
+ * Copyright (c) 2012-2015, Chris Brody
  * Copyright (c) 2005-2010, Nitobi Software Inc.
  * Copyright (c) 2010, IBM Corporation
  */
@@ -22,11 +22,7 @@ import java.lang.IllegalArgumentException;
 import java.lang.Number;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -36,6 +32,11 @@ import org.apache.cordova.CordovaPlugin;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.IOException;
 
 public class SQLitePlugin extends CordovaPlugin {
 
@@ -52,13 +53,11 @@ public class SQLitePlugin extends CordovaPlugin {
             Pattern.CASE_INSENSITIVE);
 
     /**
-     * Multiple database map (static).
-     * TBD: restructure to keep only map with the DBRunner; may not need ConcurrentHashMap.
-     * NOTE: removed public static accessor to dbmap since it would not work with db threading.
+     * Multiple database runner map (static).
+     * NOTE: no public static accessor to db (runner) map since it would not work with db threading.
      * FUTURE put DBRunner into a public class that can provide external accessor.
      */
-    static ConcurrentHashMap<String, SQLiteDatabase> dbmap = new ConcurrentHashMap<String, SQLiteDatabase>();
-    static ConcurrentHashMap<String, DBRunner> rmap = new ConcurrentHashMap<String, DBRunner>();
+    static ConcurrentHashMap<String, DBRunner> dbrmap = new ConcurrentHashMap<String, DBRunner>();
 
     /**
      * NOTE: Using default constructor, no explicit constructor.
@@ -105,7 +104,7 @@ public class SQLitePlugin extends CordovaPlugin {
                 o = args.getJSONObject(0);
                 dbname = o.getString("name");
                 // open database and start reading its queue
-                this.startDatabase(dbname, cbc);
+                this.startDatabase(dbname, o, cbc);
                 break;
 
             case close:
@@ -157,16 +156,16 @@ public class SQLitePlugin extends CordovaPlugin {
 
                 // put db query in the queue to be executed in the db thread:
                 DBQuery q = new DBQuery(queries, queryIDs, jsonparams, cbc);
-                DBRunner r = rmap.get(dbname);
+                DBRunner r = dbrmap.get(dbname);
                 if (r != null) {
-                	try {
-                		r.q.put(q); 
-                	} catch(Exception e) {
-                		Log.e(SQLitePlugin.class.getSimpleName(), "couldn't add to queue", e);
-                		cbc.error("couldn't add to queue");
-                	}
+                    try {
+                        r.q.put(q); 
+                    } catch(Exception e) {
+                        Log.e(SQLitePlugin.class.getSimpleName(), "couldn't add to queue", e);
+                        cbc.error("couldn't add to queue");
+                    }
                 } else {
-            		cbc.error("database not open");
+                    cbc.error("database not open");
                 }
                 break;
         }
@@ -179,11 +178,19 @@ public class SQLitePlugin extends CordovaPlugin {
      */
     @Override
     public void onDestroy() {
-        while (!dbmap.isEmpty()) {
-            String dbname = dbmap.keySet().iterator().next();
-            // TODO should stop the db thread(s) instead (!!)
+        while (!dbrmap.isEmpty()) {
+            String dbname = dbrmap.keySet().iterator().next();
+
             this.closeDatabaseNow(dbname);
-            dbmap.remove(dbname);
+
+            DBRunner r = dbrmap.get(dbname);
+            try {
+                // stop the db runner thread:
+                r.q.put(new DBQuery());
+            } catch(Exception e) {
+                Log.e(SQLitePlugin.class.getSimpleName(), "couldn't stop db thread", e);
+            }
+            dbrmap.remove(dbname);
         }
     }
 
@@ -191,18 +198,20 @@ public class SQLitePlugin extends CordovaPlugin {
     // LOCAL METHODS
     // --------------------------------------------------------------------------
 
-    private void startDatabase(String dbname, CallbackContext cbc) {
+    private void startDatabase(String dbname, JSONObject options, CallbackContext cbc) {
         // TODO: is it an issue that we can orphan an existing thread?  What should we do here?
         // If we re-use the existing DBRunner it might be in the process of closing...
-        DBRunner r = rmap.get(dbname);
+        DBRunner r = dbrmap.get(dbname);
+
+        // Brody TODO: It may be better to terminate the existing db thread here & start a new one, instead.
         if (r != null) {
-        	// don't orphan the existing thread; just re-open the existing database.
-        	// In the worst case it might be in the process of closing, but even that's less serious
-        	// than orphaning the old DBRunner.
+            // don't orphan the existing thread; just re-open the existing database.
+            // In the worst case it might be in the process of closing, but even that's less serious
+            // than orphaning the old DBRunner.
             cbc.success();
         } else {
-            r = new DBRunner(dbname, cbc);
-            rmap.put(dbname, r);
+            r = new DBRunner(dbname, options, cbc);
+            dbrmap.put(dbname, r);
             this.cordova.getThreadPool().execute(r);
         }
     }
@@ -211,14 +220,17 @@ public class SQLitePlugin extends CordovaPlugin {
      *
      * @param dbName   The name of the database file
      */
-    private void openDatabase(String dbname, CallbackContext cbc) {
+    private SQLiteDatabase openDatabase(String dbname, boolean createFromAssets, CallbackContext cbc) throws Exception {
         try {
             if (this.getDatabase(dbname) != null) {
-            	// this should not happen - should be blocked at the execute("open") level
-            	cbc.error("database already open");
+                // this should not happen - should be blocked at the execute("open") level
+                if (cbc != null) cbc.error("database already open");
+                throw new Exception("database already open");
             }
 
             File dbfile = this.cordova.getActivity().getDatabasePath(dbname);
+
+            if (!dbfile.exists() && createFromAssets) this.createFromAssets(dbname, dbfile);
 
             if (!dbfile.exists()) {
                 dbfile.getParentFile().mkdirs();
@@ -228,13 +240,63 @@ public class SQLitePlugin extends CordovaPlugin {
 
             SQLiteDatabase mydb = SQLiteDatabase.openOrCreateDatabase(dbfile, null);
 
-            dbmap.put(dbname, mydb);
+            if (cbc != null) // needed for Android locking/closing workaround
+                cbc.success();
 
-            cbc.success();
+            return mydb;
         } catch (SQLiteException e) {
-            cbc.error("can't open database " + e);
+            if (cbc != null) // needed for Android locking/closing workaround
+                cbc.error("can't open database " + e);
             throw e;
         }
+    }
+
+    /**
+     * If a prepopulated DB file exists in the assets folder it is copied to the dbPath.
+     * Only runs the first time the app runs.
+     */
+    private void createFromAssets(String myDBName, File dbfile)
+    {
+        InputStream in = null;
+        OutputStream out = null;
+
+            try {
+                in = this.cordova.getActivity().getAssets().open("www/" + myDBName);
+                String dbPath = dbfile.getAbsolutePath();
+                dbPath = dbPath.substring(0, dbPath.lastIndexOf("/") + 1);
+
+                File dbPathFile = new File(dbPath);
+                if (!dbPathFile.exists())
+                    dbPathFile.mkdirs();
+
+                File newDbFile = new File(dbPath + myDBName);
+                out = new FileOutputStream(newDbFile);
+
+                // XXX TODO: this is very primitive, other alternatives at:
+                // http://www.journaldev.com/861/4-ways-to-copy-file-in-java
+                byte[] buf = new byte[1024];
+                int len;
+                while ((len = in.read(buf)) > 0)
+                    out.write(buf, 0, len);
+    
+                Log.v("info", "Copied prepopulated DB content to: " + newDbFile.getAbsolutePath());
+            } catch (IOException e) {
+                Log.v("createFromAssets", "No prepopulated DB found, Error=" + e.getMessage());
+            } finally {
+                if (in != null) {
+                    try {
+                        in.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+    
+                if (out != null) {
+                    try {
+                        out.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
     }
 
     /**
@@ -243,20 +305,20 @@ public class SQLitePlugin extends CordovaPlugin {
      * @param dbName   The name of the database file
      */
     private void closeDatabase(String dbName, CallbackContext cbc) {
-        DBRunner r = rmap.get(dbName);
+        DBRunner r = dbrmap.get(dbName);
         if (r != null) {
             try {
                 r.q.put(new DBQuery(false, cbc));
             } catch(Exception e) {
-            	if (cbc != null) {
-            		cbc.error("couldn't close database" + e);
-            	}
+                if (cbc != null) {
+                    cbc.error("couldn't close database" + e);
+                }
                 Log.e(SQLitePlugin.class.getSimpleName(), "couldn't close database", e);
             }
         } else {
-        	if (cbc != null) {
-        		cbc.success();
-        	}
+            if (cbc != null) {
+                cbc.success();
+            }
         }
     }
 
@@ -270,19 +332,18 @@ public class SQLitePlugin extends CordovaPlugin {
 
         if (mydb != null) {
             mydb.close();
-            dbmap.remove(dbName);
         }
     }
 
     private void deleteDatabase(String dbname, CallbackContext cbc) {
-        DBRunner r = rmap.get(dbname);
+        DBRunner r = dbrmap.get(dbname);
         if (r != null) {
             try {
                 r.q.put(new DBQuery(true, cbc));
             } catch(Exception e) {
-            	if (cbc != null) {
-            		cbc.error("couldn't close database" + e);
-            	}
+                if (cbc != null) {
+                    cbc.error("couldn't close database" + e);
+                }
                 Log.e(SQLitePlugin.class.getSimpleName(), "couldn't close database", e);
             }
         } else {
@@ -308,14 +369,14 @@ public class SQLitePlugin extends CordovaPlugin {
         if (android.os.Build.VERSION.SDK_INT >= 11) {
             // Use try & catch just in case android.os.Build.VERSION.SDK_INT >= 16 was lying:
             try {
-            	return SQLiteDatabase.deleteDatabase(dbfile);
+                return SQLiteDatabase.deleteDatabase(dbfile);
             } catch (Exception e) {
                 Log.e(SQLitePlugin.class.getSimpleName(), "couldn't delete because old SDK_INT", e);
                 return deleteDatabasePreHoneycomb(dbfile);
             }
         } else {
             // use old API
-        	return deleteDatabasePreHoneycomb(dbfile);
+            return deleteDatabasePreHoneycomb(dbfile);
         }
     }
 
@@ -334,7 +395,8 @@ public class SQLitePlugin extends CordovaPlugin {
      * @param dbname The name of the database.
      */
     private SQLiteDatabase getDatabase(String dbname) {
-        return dbmap.get(dbname);
+        DBRunner r = dbrmap.get(dbname);
+        return (r == null) ? null :  r.mydb;
     }
 
     /**
@@ -353,9 +415,9 @@ public class SQLitePlugin extends CordovaPlugin {
         SQLiteDatabase mydb = getDatabase(dbname);
 
         if (mydb == null) {
-        	// not allowed - can only happen if someone has closed (and possibly deleted) a database and then re-used the database
-        	cbc.error("database has been closed");
-        	return;
+            // not allowed - can only happen if someone has closed (and possibly deleted) a database and then re-used the database
+            cbc.error("database has been closed");
+            return;
         }
 
 
@@ -758,63 +820,90 @@ public class SQLitePlugin extends CordovaPlugin {
 
     private class DBRunner implements Runnable {
         final String dbname;
+        private boolean createFromAssets;
+        private boolean androidLockWorkaround;
         final BlockingQueue<DBQuery> q;
         final CallbackContext openCbc;
 
-        DBRunner(final String dbname, CallbackContext cbc) {
+        SQLiteDatabase mydb;
+
+        DBRunner(final String dbname, JSONObject options, CallbackContext cbc) {
             this.dbname = dbname;
+            this.createFromAssets = options.has("createFromResource");
+            this.androidLockWorkaround = options.has("androidLockWorkaround");
+            if (this.androidLockWorkaround)
+                Log.v(SQLitePlugin.class.getSimpleName(), "Android db closing/locking workaround applied");
+
             this.q = new LinkedBlockingQueue<DBQuery>();
             this.openCbc = cbc;
         }
 
         public void run() {
-            openDatabase(dbname, this.openCbc);
+            try {
+                this.mydb = openDatabase(dbname, this.createFromAssets, this.openCbc);
+            } catch (Exception e) {
+                Log.e(SQLitePlugin.class.getSimpleName(), "unexpected error, stopping db thread", e);
+                dbrmap.remove(dbname);
+                return;
+            }
 
-            DBQuery dbq;
+            DBQuery dbq = null;
+
             try {
                 dbq = q.take();
 
                 while (!dbq.stop) {
                     executeSqlBatch(dbname, dbq.queries, dbq.jsonparams, dbq.queryIDs, dbq.cbc);
 
+                    // XXX workaround for Android locking/closing issue:
+                    if (androidLockWorkaround && dbq.queries.length == 1 && dbq.queries[0] == "COMMIT") {
+                        // Log.v(SQLitePlugin.class.getSimpleName(), "close and reopen db");
+                        closeDatabaseNow(dbname);
+                        this.mydb = openDatabase(dbname, false, null);
+                        // Log.v(SQLitePlugin.class.getSimpleName(), "close and reopen db finished");
+                    }
+
                     dbq = q.take();
                 }
+            } catch (Exception e) {
+                Log.e(SQLitePlugin.class.getSimpleName(), "unexpected error", e);
+            }
 
+            if (dbq != null && dbq.close) {
                 try {
-                	if (!rmap.remove(dbname, this)) {
-                		Log.w(SQLitePlugin.class.getSimpleName(), "Couldn't remove ourself"); // TODO: remove
-                	}
                     closeDatabaseNow(dbname);
-                    
+
+                    dbrmap.remove(dbname); // (should) remove ourself
+
                     if (!dbq.delete) {
-                    	 dbq.cbc.success();
+                        dbq.cbc.success();
                     } else {
-    	                try {
-    	                    boolean deleteResult = deleteDatabaseNow(dbname);
-    	                    if (deleteResult) {
-    	                    	dbq.cbc.success();
-    	                    } else {
-    	                    	dbq.cbc.error("couldn't delete database");
-    	                    }
-    	                } catch (Exception e) {
-    	                    Log.e(SQLitePlugin.class.getSimpleName(), "couldn't delete database", e);
-                        	dbq.cbc.error("couldn't delete database: " + e);
-    	                }
+                        try {
+                            boolean deleteResult = deleteDatabaseNow(dbname);
+                            if (deleteResult) {
+                                dbq.cbc.success();
+                            } else {
+                                dbq.cbc.error("couldn't delete database");
+                            }
+                        } catch (Exception e) {
+                            Log.e(SQLitePlugin.class.getSimpleName(), "couldn't delete database", e);
+                            dbq.cbc.error("couldn't delete database: " + e);
+                        }
                     }                    
                 } catch (Exception e) {
                     Log.e(SQLitePlugin.class.getSimpleName(), "couldn't close database", e);
                     if (dbq.cbc != null) {
-                    	dbq.cbc.error("couldn't close database: " + e);
+                        dbq.cbc.error("couldn't close database: " + e);
                     }
                 }
-            } catch (Exception e) {
-                Log.e(SQLitePlugin.class.getSimpleName(), "unexpected error", e);
             }
         }
     }
 
     private final class DBQuery {
+        // XXX TODO replace with DBRunner action enum:
         final boolean stop;
+        final boolean close;
         final boolean delete;
         final String[] queries;
         final String[] queryIDs;
@@ -823,6 +912,7 @@ public class SQLitePlugin extends CordovaPlugin {
 
         DBQuery(String[] myqueries, String[] qids, JSONArray[] params, CallbackContext c) {
             this.stop = false;
+            this.close = false;
             this.delete = false;
             this.queries = myqueries;
             this.queryIDs = qids;
@@ -832,11 +922,23 @@ public class SQLitePlugin extends CordovaPlugin {
 
         DBQuery(boolean delete, CallbackContext cbc) {
             this.stop = true;
+            this.close = true;
             this.delete = delete;
             this.queries = null;
             this.queryIDs = null;
             this.jsonparams = null;
             this.cbc = cbc;
+        }
+
+        // signal the DBRunner thread to stop:
+        DBQuery() {
+            this.stop = true;
+            this.close = false;
+            this.delete = false;
+            this.queries = null;
+            this.queryIDs = null;
+            this.jsonparams = null;
+            this.cbc = null;
         }
     }
 

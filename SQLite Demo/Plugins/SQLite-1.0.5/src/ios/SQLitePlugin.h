@@ -1,19 +1,15 @@
 /*
- * Copyright (C) 2011-2013 Chris Brody
+ * Copyright (C) 2012-2015 Chris Brody
  * Copyright (C) 2011 Davide Bertola
  *
  * This library is available under the terms of the MIT License (2008).
  * See http://opensource.org/licenses/alphabetical for full text.
  */
 
-#import <Foundation/Foundation.h>
-
-#import "sqlite3.h"
-
 #import <Cordova/CDVPlugin.h>
-#import <Cordova/CDVJSON.h>
 
-#import "AppDelegate.h"
+// Used to remove dependency on sqlite3.h in this header:
+struct sqlite3;
 
 enum WebSQLError {
     UNKNOWN_ERR = 0,
@@ -32,7 +28,7 @@ typedef int WebSQLError;
 }
 
 @property (nonatomic, copy) NSMutableDictionary *openDBs;
-@property (nonatomic, retain) NSString *appDocsPath;
+@property (nonatomic, copy) NSMutableDictionary *appDBPaths;
 
 // Open / Close
 -(void) open: (CDVInvokedUrlCommand*)command;
@@ -50,15 +46,12 @@ typedef int WebSQLError;
 // Perform the SQL request
 -(CDVPluginResult*) executeSqlWithDict: (NSMutableDictionary*)dict andArgs: (NSMutableDictionary*)dbargs;
 
--(id) getDBPath:(id)dbFile;
+-(id) getDBPath:(NSString *)dbFile at:(NSString *)atkey;
 
-+(NSDictionary *)captureSQLiteErrorFromDb:(sqlite3 *)db;
++(NSDictionary *)captureSQLiteErrorFromDb:(struct sqlite3 *)db;
 
 +(int)mapSQLiteErrorCode:(int)code;
 
-// LIBB64
-+(id) getBlobAsBase64String:(const char*) blob_chars
-                            withlength: (int) blob_length;
-// LIBB64---END
-
++(NSString*)getBlobAsBase64String:(const char*) blob_chars
+                       withlength:(int) blob_length;
 @end

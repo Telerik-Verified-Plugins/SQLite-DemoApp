@@ -1,24 +1,47 @@
 # SQLitePlugin in Markdown (litcoffee)
 
-New coffee compiler can compile this directly into Javascript
+#### Use coffee compiler to compile this directly into Javascript
 
-License for common Javascript: MIT or Apache
+#### License for common script: MIT or Apache
 
-## Top-level SQLitePlugin objects
+# Top-level SQLitePlugin objects
 
-### root window object:
+## root window object:
 
     root = @
 
-### constant(s):
+## constant(s):
 
     READ_ONLY_REGEX = /^\s*(?:drop|delete|insert|update|create)\s/i
 
-### global(s):
+## global(s):
 
     txLocks = {}
 
-### utility function(s):
+## utility functions:
+
+    # Errors returned to callbacks must conform to `SqlError` with a code and message.
+    # Some errors are of type `Error` or `string` and must be converted.
+    newSQLError = (error, code) ->
+      sqlError = error
+      code = 0 if !code # unknown by default
+
+      if !sqlError
+        sqlError = new Error "a plugin had an error but provided no response"
+        sqlError.code = code
+
+      if typeof sqlError is "string"
+        sqlError = new Error error
+        sqlError.code = code
+
+      if !sqlError.code && sqlError.message
+        sqlError.code = code
+
+      if !sqlError.code && !sqlError.message
+        sqlError = new Error "an unknown error was returned: " + JSON.stringify(sqlError)
+        sqlError.code = code
+
+      return sqlError
 
     nextTick = window.setImmediate || (fun) ->
       window.setTimeout(fun, 0)
@@ -40,7 +63,7 @@ License for common Javascript: MIT or Apache
         else
           return fun.call this, []
 
-### SQLitePlugin db-connection
+## SQLitePlugin db-connection
 
 #### SQLitePlugin object is defined by a constructor function and prototype member functions:
 
@@ -48,7 +71,7 @@ License for common Javascript: MIT or Apache
       console.log "SQLitePlugin openargs: #{JSON.stringify openargs}"
 
       if !(openargs and openargs['name'])
-        throw new Error("Cannot create a SQLitePlugin instance without a db name")
+        throw newSQLError "Cannot create a SQLitePlugin db instance without a db name"
 
       dbname = openargs.name
 
@@ -87,15 +110,17 @@ License for common Javascript: MIT or Apache
 
     SQLitePlugin::transaction = (fn, error, success) ->
       if !@openDBs[@dbname]
-        error('database not open')
+        error newSQLError 'database not open'
         return
+
       @addTransaction new SQLitePluginTransaction(this, fn, error, success, true, false)
       return
 
     SQLitePlugin::readTransaction = (fn, error, success) ->
       if !@openDBs[@dbname]
-        error('database not open')
+        error newSQLError 'database not open'
         return
+
       @addTransaction new SQLitePluginTransaction(this, fn, error, success, true, true)
       return
 
@@ -112,22 +137,28 @@ License for common Javascript: MIT or Apache
 
     SQLitePlugin::open = (success, error) ->
       onSuccess = () => success this
-      unless @dbname of @openDBs
-        @openDBs[@dbname] = true
-        cordova.exec onSuccess, error, "SQLitePlugin", "open", [ @openargs ]
-      else
+
+      if @dbname of @openDBs
         ###
         for a re-open run onSuccess async so that the openDatabase return value
         can be used in the success handler as an alternative to the handler's
         db argument
         ###
-        nextTick () -> onSuccess();
+        nextTick () -> onSuccess()
+      else
+        @openDBs[@dbname] = true
+        cordova.exec onSuccess, error, "SQLitePlugin", "open", [ @openargs ]
+
       return
 
     SQLitePlugin::close = (success, error) ->
       #console.log "SQLitePlugin.prototype.close"
 
       if @dbname of @openDBs
+        if txLocks[@dbname] && txLocks[@dbname].inProgress
+          error newSQLError 'database cannot be closed while a transaction is in progress'
+          return
+
         delete @openDBs[@dbname]
 
         cordova.exec success, error, "SQLitePlugin", "close", [ { path: @dbname } ]
@@ -139,13 +170,13 @@ License for common Javascript: MIT or Apache
       myerror = (t, e) -> if !!error then error e
 
       myfn = (tx) ->
-        tx.executeSql(statement, params, mysuccess, myerror)
+        tx.addStatement(statement, params, mysuccess, myerror)
         return
 
       @addTransaction new SQLitePluginTransaction(this, myfn, null, null, false, false)
       return
 
-### SQLitePluginTransaction object for batching:
+## SQLitePluginTransaction object for batching:
 
     ###
     Transaction batching object:
@@ -158,7 +189,7 @@ License for common Javascript: MIT or Apache
         prevents us from stalling our txQueue if somebody passes a
         false value for fn.
         ###
-        throw new Error("transaction expected a function")
+        throw newSQLError "transaction expected a function"
 
       @db = db
       @fn = fn
@@ -169,8 +200,8 @@ License for common Javascript: MIT or Apache
       @executes = []
 
       if txlock
-        @executeSql "BEGIN", [], null, (tx, err) ->
-          throw new Error("unable to begin transaction: " + err.message)
+        @addStatement "BEGIN", [], null, (tx, err) ->
+          throw newSQLError "unable to begin transaction: " + err.message, err.code
 
       return
 
@@ -185,17 +216,37 @@ License for common Javascript: MIT or Apache
         txLocks[@db.dbname].inProgress = false
         @db.startNextTransaction()
         if @error
-          @error err
+          @error newSQLError err
       return
 
     SQLitePluginTransaction::executeSql = (sql, values, success, error) ->
+
+      if @finalized
+        throw {message: 'InvalidStateError: DOM Exception 11: This transaction is already finalized. Transactions are committed after its success or failure handlers are called. If you are using a Promise to handle callbacks, be aware that implementations following the A+ standard adhere to run-to-completion semantics and so Promise resolution occurs on a subsequent tick and therefore after the transaction commits.', code: 11}
+        return
 
       if @readOnly && READ_ONLY_REGEX.test(sql)
         @handleStatementFailure(error, {message: 'invalid sql for a read-only transaction'})
         return
 
+      @addStatement(sql, values, success, error)
+      return
+
+    # This method adds the SQL statement to the transaction queue but does not check for
+    # finalization since it is used to execute COMMIT and ROLLBACK.
+    SQLitePluginTransaction::addStatement = (sql, values, success, error) ->
 
       qid = @executes.length
+
+      params = []
+      if !!values && values.constructor == Array
+        for v in values
+          t = typeof v
+          params.push (
+            if v == null || v == undefined || t == 'number' || t == 'string' then v
+            else if v instanceof Blob then v.valueOf()
+            else v.toString()
+          )
 
       @executes.push
         success: success
@@ -203,7 +254,8 @@ License for common Javascript: MIT or Apache
         qid: qid
 
         sql: sql
-        params: values || []
+        #params: values || []
+        params: params
 
       return
 
@@ -228,9 +280,9 @@ License for common Javascript: MIT or Apache
 
     SQLitePluginTransaction::handleStatementFailure = (handler, response) ->
       if !handler
-        throw new Error "a statement with no error handler failed: " + response.message
-      if handler(this, response)
-        throw new Error "a statement error callback did not return false"
+        throw newSQLError "a statement with no error handler failed: " + response.message, response.code
+      if handler(this, response) isnt false
+        throw newSQLError "a statement error callback did not return false: " + response.message, response.code
       return
 
     SQLitePluginTransaction::run = ->
@@ -248,9 +300,10 @@ License for common Javascript: MIT or Apache
             if didSucceed
               tx.handleStatementSuccess batchExecutes[index].success, response
             else
-              tx.handleStatementFailure batchExecutes[index].error, response
+              tx.handleStatementFailure batchExecutes[index].error, newSQLError(response)
           catch err
-            txFailure = err  unless txFailure
+            if !txFailure
+              txFailure = newSQLError(err)
 
           if --waiting == 0
             if txFailure
@@ -281,8 +334,6 @@ License for common Javascript: MIT or Apache
 
         tropts.push
           qid: qid
-          # for ios version:
-          query: [request.sql].concat(request.params)
           sql: request.sql
           params: request.params
 
@@ -321,13 +372,13 @@ License for common Javascript: MIT or Apache
       failed = (tx, err) ->
         txLocks[tx.db.dbname].inProgress = false
         tx.db.startNextTransaction()
-        if tx.error then tx.error new Error("error while trying to roll back: " + err.message)
+        if tx.error then tx.error newSQLError("error while trying to roll back: " + err.message, err.code)
         return
 
       @finalized = true
 
       if @txlock
-        @executeSql "ROLLBACK", [], succeeded, failed
+        @addStatement "ROLLBACK", [], succeeded, failed
         @run()
       else
         succeeded(tx)
@@ -347,20 +398,22 @@ License for common Javascript: MIT or Apache
       failed = (tx, err) ->
         txLocks[tx.db.dbname].inProgress = false
         tx.db.startNextTransaction()
-        if tx.error then tx.error new Error("error while trying to commit: " + err.message)
+        if tx.error then tx.error newSQLError("error while trying to commit: " + err.message, err.code)
         return
 
       @finalized = true
 
       if @txlock
-        @executeSql "COMMIT", [], succeeded, failed
+        @addStatement "COMMIT", [], succeeded, failed
         @run()
       else
         succeeded(tx)
 
       return
 
-### SQLite plugin object factory:
+## SQLite plugin object factory:
+
+    dblocations = [ "docs", "libs", "nosync" ]
 
     SQLiteFactory =
       ###
@@ -391,13 +444,36 @@ License for common Javascript: MIT or Apache
             okcb = args[1]
             if args.length > 2 then errorcb = args[2]
 
+        dblocation = if !!openargs.location then dblocations[openargs.location] else null
+        openargs.dblocation = dblocation || dblocations[0]
+
+        if !!openargs.createFromLocation and openargs.createFromLocation == 1
+          openargs.createFromResource = "1"
+
+        if !!openargs.androidLockWorkaround and openargs.androidLockWorkaround == 1
+          openargs.androidLockWorkaround = 1
+
         new SQLitePlugin openargs, okcb, errorcb
 
-      deleteDb: (databaseName, success, error) ->
-        delete SQLitePlugin::openDBs[databaseName]
-        cordova.exec success, error, "SQLitePlugin", "delete", [{ path: databaseName }]
+      deleteDb: (first, success, error) ->
+        args = {}
 
-### Exported API:
+        if first.constructor == String
+          #console.log "delete db name: #{first}"
+          args.path = first
+          args.dblocation = dblocations[0]
+
+        else
+          #console.log "delete db args: #{JSON.stringify first}"
+          if !(first and first['name']) then throw new Error "Please specify db name"
+          args.path = first.name
+          dblocation = if !!first.location then dblocations[first.location] else null
+          args.dblocation = dblocation || dblocations[0]
+
+        delete SQLitePlugin::openDBs[args.path]
+        cordova.exec success, error, "SQLitePlugin", "delete", [ args ]
+
+## Exported API:
 
     root.sqlitePlugin =
       sqliteFeatures:

@@ -10,7 +10,10 @@
             if (!this.checkSimulator()) {
             	db = window.sqlitePlugin.openDatabase(
                     // options
-                    {name: "demo"},
+                    {
+                      name: "demo.db",
+                      location: 1 // for iOS, see the doc for details
+                    },
                     // success callback
                     function (msg) {
                         alert("success: " + JSON.stringify(msg));

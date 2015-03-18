@@ -1,11 +1,35 @@
 (function() {
-  var READ_ONLY_REGEX, SQLiteFactory, SQLitePlugin, SQLitePluginTransaction, argsArray, nextTick, root, txLocks;
+  var READ_ONLY_REGEX, SQLiteFactory, SQLitePlugin, SQLitePluginTransaction, argsArray, dblocations, newSQLError, nextTick, root, txLocks;
 
   root = this;
 
   READ_ONLY_REGEX = /^\s*(?:drop|delete|insert|update|create)\s/i;
 
   txLocks = {};
+
+  newSQLError = function(error, code) {
+    var sqlError;
+    sqlError = error;
+    if (!code) {
+      code = 0;
+    }
+    if (!sqlError) {
+      sqlError = new Error("a plugin had an error but provided no response");
+      sqlError.code = code;
+    }
+    if (typeof sqlError === "string") {
+      sqlError = new Error(error);
+      sqlError.code = code;
+    }
+    if (!sqlError.code && sqlError.message) {
+      sqlError.code = code;
+    }
+    if (!sqlError.code && !sqlError.message) {
+      sqlError = new Error("an unknown error was returned: " + JSON.stringify(sqlError));
+      sqlError.code = code;
+    }
+    return sqlError;
+  };
 
   nextTick = window.setImmediate || function(fun) {
     window.setTimeout(fun, 0);
@@ -38,7 +62,7 @@
     var dbname;
     console.log("SQLitePlugin openargs: " + (JSON.stringify(openargs)));
     if (!(openargs && openargs['name'])) {
-      throw new Error("Cannot create a SQLitePlugin instance without a db name");
+      throw newSQLError("Cannot create a SQLitePlugin db instance without a db name");
     }
     dbname = openargs.name;
     this.openargs = openargs;
@@ -73,7 +97,7 @@
 
   SQLitePlugin.prototype.transaction = function(fn, error, success) {
     if (!this.openDBs[this.dbname]) {
-      error('database not open');
+      error(newSQLError('database not open'));
       return;
     }
     this.addTransaction(new SQLitePluginTransaction(this, fn, error, success, true, false));
@@ -81,7 +105,7 @@
 
   SQLitePlugin.prototype.readTransaction = function(fn, error, success) {
     if (!this.openDBs[this.dbname]) {
-      error('database not open');
+      error(newSQLError('database not open'));
       return;
     }
     this.addTransaction(new SQLitePluginTransaction(this, fn, error, success, true, true));
@@ -107,10 +131,7 @@
         return success(_this);
       };
     })(this);
-    if (!(this.dbname in this.openDBs)) {
-      this.openDBs[this.dbname] = true;
-      cordova.exec(onSuccess, error, "SQLitePlugin", "open", [this.openargs]);
-    } else {
+    if (this.dbname in this.openDBs) {
 
       /*
       for a re-open run onSuccess async so that the openDatabase return value
@@ -120,11 +141,18 @@
       nextTick(function() {
         return onSuccess();
       });
+    } else {
+      this.openDBs[this.dbname] = true;
+      cordova.exec(onSuccess, error, "SQLitePlugin", "open", [this.openargs]);
     }
   };
 
   SQLitePlugin.prototype.close = function(success, error) {
     if (this.dbname in this.openDBs) {
+      if (txLocks[this.dbname] && txLocks[this.dbname].inProgress) {
+        error(newSQLError('database cannot be closed while a transaction is in progress'));
+        return;
+      }
       delete this.openDBs[this.dbname];
       cordova.exec(success, error, "SQLitePlugin", "close", [
         {
@@ -147,7 +175,7 @@
       }
     };
     myfn = function(tx) {
-      tx.executeSql(statement, params, mysuccess, myerror);
+      tx.addStatement(statement, params, mysuccess, myerror);
     };
     this.addTransaction(new SQLitePluginTransaction(this, myfn, null, null, false, false));
   };
@@ -166,7 +194,7 @@
       prevents us from stalling our txQueue if somebody passes a
       false value for fn.
        */
-      throw new Error("transaction expected a function");
+      throw newSQLError("transaction expected a function");
     }
     this.db = db;
     this.fn = fn;
@@ -176,8 +204,8 @@
     this.readOnly = readOnly;
     this.executes = [];
     if (txlock) {
-      this.executeSql("BEGIN", [], null, function(tx, err) {
-        throw new Error("unable to begin transaction: " + err.message);
+      this.addStatement("BEGIN", [], null, function(tx, err) {
+        throw newSQLError("unable to begin transaction: " + err.message, err.code);
       });
     }
   };
@@ -196,26 +224,45 @@
       txLocks[this.db.dbname].inProgress = false;
       this.db.startNextTransaction();
       if (this.error) {
-        this.error(err);
+        this.error(newSQLError(err));
       }
     }
   };
 
   SQLitePluginTransaction.prototype.executeSql = function(sql, values, success, error) {
-    var qid;
+    if (this.finalized) {
+      throw {
+        message: 'InvalidStateError: DOM Exception 11: This transaction is already finalized. Transactions are committed after its success or failure handlers are called. If you are using a Promise to handle callbacks, be aware that implementations following the A+ standard adhere to run-to-completion semantics and so Promise resolution occurs on a subsequent tick and therefore after the transaction commits.',
+        code: 11
+      };
+      return;
+    }
     if (this.readOnly && READ_ONLY_REGEX.test(sql)) {
       this.handleStatementFailure(error, {
         message: 'invalid sql for a read-only transaction'
       });
       return;
     }
+    this.addStatement(sql, values, success, error);
+  };
+
+  SQLitePluginTransaction.prototype.addStatement = function(sql, values, success, error) {
+    var params, qid, t, v, _i, _len;
     qid = this.executes.length;
+    params = [];
+    if (!!values && values.constructor === Array) {
+      for (_i = 0, _len = values.length; _i < _len; _i++) {
+        v = values[_i];
+        t = typeof v;
+        params.push((v === null || v === void 0 || t === 'number' || t === 'string' ? v : v instanceof Blob ? v.valueOf() : v.toString()));
+      }
+    }
     this.executes.push({
       success: success,
       error: error,
       qid: qid,
       sql: sql,
-      params: values || []
+      params: params
     });
   };
 
@@ -240,10 +287,10 @@
 
   SQLitePluginTransaction.prototype.handleStatementFailure = function(handler, response) {
     if (!handler) {
-      throw new Error("a statement with no error handler failed: " + response.message);
+      throw newSQLError("a statement with no error handler failed: " + response.message, response.code);
     }
-    if (handler(this, response)) {
-      throw new Error("a statement error callback did not return false");
+    if (handler(this, response) !== false) {
+      throw newSQLError("a statement error callback did not return false: " + response.message, response.code);
     }
   };
 
@@ -262,12 +309,12 @@
           if (didSucceed) {
             tx.handleStatementSuccess(batchExecutes[index].success, response);
           } else {
-            tx.handleStatementFailure(batchExecutes[index].error, response);
+            tx.handleStatementFailure(batchExecutes[index].error, newSQLError(response));
           }
         } catch (_error) {
           err = _error;
           if (!txFailure) {
-            txFailure = err;
+            txFailure = newSQLError(err);
           }
         }
         if (--waiting === 0) {
@@ -297,7 +344,6 @@
       };
       tropts.push({
         qid: qid,
-        query: [request.sql].concat(request.params),
         sql: request.sql,
         params: request.params
       });
@@ -345,12 +391,12 @@
       txLocks[tx.db.dbname].inProgress = false;
       tx.db.startNextTransaction();
       if (tx.error) {
-        tx.error(new Error("error while trying to roll back: " + err.message));
+        tx.error(newSQLError("error while trying to roll back: " + err.message, err.code));
       }
     };
     this.finalized = true;
     if (this.txlock) {
-      this.executeSql("ROLLBACK", [], succeeded, failed);
+      this.addStatement("ROLLBACK", [], succeeded, failed);
       this.run();
     } else {
       succeeded(tx);
@@ -374,17 +420,19 @@
       txLocks[tx.db.dbname].inProgress = false;
       tx.db.startNextTransaction();
       if (tx.error) {
-        tx.error(new Error("error while trying to commit: " + err.message));
+        tx.error(newSQLError("error while trying to commit: " + err.message, err.code));
       }
     };
     this.finalized = true;
     if (this.txlock) {
-      this.executeSql("COMMIT", [], succeeded, failed);
+      this.addStatement("COMMIT", [], succeeded, failed);
       this.run();
     } else {
       succeeded(tx);
     }
   };
+
+  dblocations = ["docs", "libs", "nosync"];
 
   SQLiteFactory = {
 
@@ -395,7 +443,7 @@
     have to translate it back to CoffeeScript by hand.
      */
     opendb: argsArray(function(args) {
-      var errorcb, first, okcb, openargs;
+      var dblocation, errorcb, first, okcb, openargs;
       if (args.length < 1) {
         return null;
       }
@@ -422,15 +470,32 @@
           }
         }
       }
+      dblocation = !!openargs.location ? dblocations[openargs.location] : null;
+      openargs.dblocation = dblocation || dblocations[0];
+      if (!!openargs.createFromLocation && openargs.createFromLocation === 1) {
+        openargs.createFromResource = "1";
+      }
+      if (!!openargs.androidLockWorkaround && openargs.androidLockWorkaround === 1) {
+        openargs.androidLockWorkaround = 1;
+      }
       return new SQLitePlugin(openargs, okcb, errorcb);
     }),
-    deleteDb: function(databaseName, success, error) {
-      delete SQLitePlugin.prototype.openDBs[databaseName];
-      return cordova.exec(success, error, "SQLitePlugin", "delete", [
-        {
-          path: databaseName
+    deleteDb: function(first, success, error) {
+      var args, dblocation;
+      args = {};
+      if (first.constructor === String) {
+        args.path = first;
+        args.dblocation = dblocations[0];
+      } else {
+        if (!(first && first['name'])) {
+          throw new Error("Please specify db name");
         }
-      ]);
+        args.path = first.name;
+        dblocation = !!first.location ? dblocations[first.location] : null;
+        args.dblocation = dblocation || dblocations[0];
+      }
+      delete SQLitePlugin.prototype.openDBs[args.path];
+      return cordova.exec(success, error, "SQLitePlugin", "delete", [args]);
     }
   };
 

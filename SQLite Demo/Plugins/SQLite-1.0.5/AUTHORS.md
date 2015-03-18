@@ -19,13 +19,10 @@
 
 - Original authors: @davibe (Davide Bertola <dade@dadeb.it>) and @joenoon (Joe Noon <joenoon@gmail.com>)
 - Cordova 2.7+ port with background processing by @j3k0 (Jean-Christophe Hoelt <hoelt@fovea.cc>)
-- Embedded public domain LIBB64 encoding routines from http://libb64.sourceforge.net by @tbbdeveloper (Chris Robertson <oztexan@gmail.com>)
 - Maintained by @brodybits (Chris Brody)
 
-## WP version
+## WP(8) version
 
-- Original author: @marcucio
-- Enhancements for background processing & improved transaction support by @Gillardo (Darren Gillard)
-- DLL integration by @nadyaA (Nadezhda Atanasova) & @Gillardo (Darren Gillard)
-- DB threading and open/close/delete fixes by mark.oppenheim@mnetics.co.uk
-
+- Original author: @marcucio (Mike Arcucio <mike@marcucio.com>)
+- Enhancements for background processing & improved transaction support by @Gillardo (Darren Gillard <darren.gillard81@gmail.com>)
+- DB threading and open/close/delete fixes by Mark Oppenheim <mark.oppenheim@mnetics.co.uk>
