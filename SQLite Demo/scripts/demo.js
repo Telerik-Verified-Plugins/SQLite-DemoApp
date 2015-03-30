@@ -66,6 +66,32 @@
             }
         },
 
+        readRecords: function () {
+            if (!this.checkSimulator()) {
+                if (this.checkOpenedDatabase()) {
+                    db.transaction(function(tx) {
+                        tx.executeSql(
+                            "select * from test;",
+                            [],
+                            function(tx, res) {
+                                for (var i=0; i<res.rows.length; i++) {
+                                    var row = res.rows.item(i);
+                                    alert(
+                                      "row " + i + ":\n" +
+                                      " - id = " +  row.id + "\n" +
+                                      " - data = " +  row.data + "\n" +
+                                      " - data_num = " +  row.data_num
+                                    );
+                                }
+                            },
+                            function(tx, res) {
+                                alert('error: ' + res.message);
+                            });
+                    });
+                }
+            }
+        },
+
         countRecords: function () {
             if (!this.checkSimulator()) {
                 if (this.checkOpenedDatabase()) {
